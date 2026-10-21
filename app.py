@@ -464,7 +464,8 @@ def split_retencoes(r):
     vals[combo[-1]] += total - sum(vals.values())     # fecha a soma exata com o valor da prefeitura
     r["PIS/PASEP"] = _brl(vals["PIS"]) if "PIS" in vals else ""
     r["COFINS"] = _brl(vals["COFINS"]) if "COFINS" in vals else ""
-    r["CSLL"] = _brl(vals["CSLL"]) if "CSLL" in vals else "0,00"
+    r["CSLL"] = _brl(vals["CSLL"]) if "CSLL" in vals else ""
+    r["_agreg"] = total                               # valor agregado original (ordem 60), só p/ conferência
     return r, "desmembrada"
 
 
@@ -513,6 +514,7 @@ def convert(rows, im, d1, d2):
     ctx = Ctx()
     lines = ["1" + VERSAO + im.rjust(8, "0")[:8] + d1.strftime("%Y%m%d") + d2.strftime("%Y%m%d")]
     recs, tot, n_zero = [], [0, 0, 0, 0], 0
+    ret = {"PIS": 0, "COFINS": 0, "INSS": 0, "IR": 0, "CSSL": 0}
     for r in rows:
         num = digits(get(r, "Nº NFS-e"))
         ctx.cur = f"Nota {num or '?'}"
@@ -523,6 +525,8 @@ def convert(rows, im, d1, d2):
         n_zero += zeroed
         for i, o in enumerate((27, 28, 31, 32)):
             tot[i] += int(vals[o])
+        for nome_r, o in (("PIS", 56), ("COFINS", 57), ("INSS", 58), ("IR", 59), ("CSSL", 60)):
+            ret[nome_r] += int(vals[o]) if vals[o].strip() else 0
         recs.append({"Nº": num, "Emissão": vals[3][:8], "Tipo RPS": vals[5].strip(),
                      "Data RPS": vals[8].strip(),
                      "Situação": vals[23].strip(),
@@ -531,13 +535,14 @@ def convert(rows, im, d1, d2):
                      "Crédito": br(int(vals[32])),
                      "PIS": br_or_blank(vals[56]), "COFINS": br_or_blank(vals[57]),
                      "CSSL": br_or_blank(vals[60]),
+                     "Σ PIS+COFINS+CSSL": br(sum(int(vals[o]) for o in (56, 57, 60) if vals[o].strip())),
                      "Tam. linha": len(line),
                      "_vals": vals, "_disc": disc})
     n = len(rows)
     lines.append("9" + str(n).rjust(7, "0") + "".join(str(t).rjust(15, "0") for t in tot))
     txt = CRLF.join(lines) + CRLF
     return {"txt_bytes": txt.encode("latin-1", errors="replace"), "recs": recs, "tot": tot,
-            "n": n, "n_zero": n_zero, "warnings": ctx.warnings, "lines": lines}
+            "ret": ret, "n": n, "n_zero": n_zero, "warnings": ctx.warnings, "lines": lines}
 
 
 def out_name(name, im, d1, d2):
@@ -672,6 +677,29 @@ for i, (tab, f) in enumerate(zip(tabs, files)):
             m2[0].metric("Σ Valor dos serviços", br(res["tot"][0]))
             m2[1].metric("Σ ISS", br(res["tot"][2]))
             m2[2].metric("Σ Crédito", br(res["tot"][3]))
+
+            # Somas das retenções (PIS, COFINS, CSLL, INSS, IR)
+            r1 = res["ret"]
+            if kind == "NFS-e" or sum(r1.values()) > 0:
+                m3 = st.columns(6)
+                m3[0].metric("Σ PIS retido", br(r1["PIS"]))
+                m3[1].metric("Σ COFINS retido", br(r1["COFINS"]))
+                m3[2].metric("Σ CSLL retido", br(r1["CSSL"]))
+                m3[3].metric("Σ INSS", br(r1["INSS"]))
+                m3[4].metric("Σ IR", br(r1["IR"]))
+                m3[5].metric("Σ PIS+COFINS+CSLL", br(r1["PIS"] + r1["COFINS"] + r1["CSSL"]))
+
+            # Conferência do desmembramento: soma separada x valor agregado da Prefeitura (ordem 60)
+            desm_rows = [r for r in canon_per if "_agreg" in r and not must_zero(r)]
+            if desm_rows:
+                agreg = sum(r["_agreg"] for r in desm_rows)
+                separado = sum((cents(get(r, k)) or 0) for r in desm_rows
+                               for k in ("PIS/PASEP", "COFINS", "CSLL"))
+                if agreg == separado:
+                    st.success(f"Conferência OK: {len(desm_rows)} nota(s) desmembrada(s). "
+                               f"Agregado da Prefeitura = soma de PIS+COFINS+CSLL = R$ {br(agreg)}")
+                else:
+                    st.error(f"Divergência: agregado R$ {br(agreg)} x separado R$ {br(separado)}")
 
             if split_cnt is not None:
                 st.caption(f"Retenções federais: {split_cnt.get('desmembrada', 0)} desmembradas, "
