@@ -22,11 +22,15 @@ html, body, [class*="css"]{font-family:'Knowledge2017','Source Sans Pro',Arial,s
 .tr-dots{display:grid;grid-template-columns:repeat(3,10px);gap:4px;}
 .tr-dots span{width:10px;height:10px;border-radius:50%;background:#FA6400;display:block;}
 .tr-dots span:nth-child(even){background:#FF8000;}
-.tr-header h1{color:#fff;font-size:1.6rem;margin:0;padding:0;font-weight:600;}
-.tr-header p{color:#D8D8D8;margin:2px 0 0 0;font-size:.9rem;}
+.tr-header h1{color:#fff !important;font-size:1.6rem;margin:0;padding:0;font-weight:600;}
+.tr-header p{color:#D8D8D8 !important;margin:2px 0 0 0;font-size:.9rem;}
 .stButton>button,.stDownloadButton>button{background:#FA6400;color:#fff;border:0;border-radius:2px;font-weight:600;}
 .stButton>button:hover,.stDownloadButton>button:hover{background:#D64000;color:#fff;}
 [data-testid="stMetric"]{background:#F5F5F5;border-left:4px solid #FA6400;padding:10px 14px;border-radius:2px;}
+[data-testid="stMetric"] *{color:#404040 !important;}
+[data-testid="stMetricLabel"] p{font-size:.8rem;white-space:normal;}
+[data-testid="stMetricValue"]{font-size:1.4rem;}
+[data-testid="stMetricValue"] > div{white-space:normal;overflow:visible;text-overflow:clip;}
 .stTabs [aria-selected="true"]{color:#FA6400 !important;}
 .stTabs [data-baseweb="tab-highlight"]{background-color:#FA6400 !important;}
 section[data-testid="stSidebar"]{border-right:3px solid #FA6400;}
@@ -96,6 +100,18 @@ def parse_dt(v):
     d, mo, y, hh, mi, ss = m.groups()
     try:
         return datetime(int(y), int(mo), int(d), int(hh or 0), int(mi or 0), int(ss or 0))
+    except ValueError:
+        return None
+
+
+def period_from_name(name):
+    """Período AAAAMMDD_AAAAMMDD no nome do arquivo (ex.: NFTS_11467690_20260901_20260930.csv)."""
+    m = re.search(r"(\d{8})_(\d{8})", name)
+    if not m:
+        return None
+    try:
+        return (datetime.strptime(m.group(1), "%Y%m%d").date(),
+                datetime.strptime(m.group(2), "%Y%m%d").date())
     except ValueError:
         return None
 
@@ -433,11 +449,7 @@ with st.sidebar:
     st.header("Opções")
     logo = st.file_uploader("Logo (opcional)", type=["png", "jpg", "jpeg"])
     if logo:
-        st.image(logo, use_container_width=True)
-    st.caption(
-        f"Parâmetros fixos: leiaute **v{VERSAO}**, campo reservado de **{RESERVADO}** posições, "
-        "todos os valores zerados nas notas **C**, **E** e **S**."
-    )
+        st.image(logo)
 
 files = st.file_uploader("Selecione os CSVs (NFS-e prestados, NFS-e tomados e/ou NFTS)",
                          type=["csv"], accept_multiple_files=True)
@@ -464,9 +476,13 @@ for i, (tab, f) in enumerate(zip(tabs, files)):
                                 help="Define de qual parte sai a Inscrição Municipal do cabeçalho.")
             im = c2.text_input("Inscrição Municipal (8 dígitos)", contrib_im(canon, role), max_chars=8,
                                key=f"im_{i}_{role}")
+
             dts = [d for d in (parse_dt(get(r, "Data Hora NFE")) for r in canon) if d]
             dmin = min(dts).date() if dts else date.today()
             dmax = max(dts).date() if dts else date.today()
+            nome_per = period_from_name(f.name)          # período no nome do arquivo tem prioridade
+            if nome_per:
+                dmin, dmax = nome_per
             with c3:
                 p1, p2 = st.columns(2)
                 d1 = p1.date_input("Início do período", dmin, key=f"d1_{i}_{role}", format="DD/MM/YYYY")
@@ -480,13 +496,14 @@ for i, (tab, f) in enumerate(zip(tabs, files)):
             results[f.name] = res
             fname = out_name(f.name)
 
-            m = st.columns(6)
-            m[0].metric("Origem", "NFTS → recebidas" if kind == "NFTS" else "NFS-e")
-            m[1].metric("Linhas de detalhe", res["n"])
-            m[2].metric("Notas zeradas (C/E/S)", res["n_zero"])
-            m[3].metric("Σ Valor dos serviços", br(res["tot"][0]))
-            m[4].metric("Σ ISS", br(res["tot"][2]))
-            m[5].metric("Σ Crédito", br(res["tot"][3]))
+            m1 = st.columns(3)
+            m1[0].metric("Origem", "NFTS → recebidas" if kind == "NFTS" else "NFS-e")
+            m1[1].metric("Linhas de detalhe", res["n"])
+            m1[2].metric("Notas zeradas (C/E/S)", res["n_zero"])
+            m2 = st.columns(3)
+            m2[0].metric("Σ Valor dos serviços", br(res["tot"][0]))
+            m2[1].metric("Σ ISS", br(res["tot"][2]))
+            m2[2].metric("Σ Crédito", br(res["tot"][3]))
 
             if len(res["txt_bytes"]) > MAX_BYTES:
                 st.error("O arquivo gerado excede 10 MB (limite do manual). Divida por período.")
@@ -501,7 +518,7 @@ for i, (tab, f) in enumerate(zip(tabs, files)):
 
             with st.expander("Pré-visualização dos registros"):
                 st.dataframe(pd.DataFrame(res["recs"]).drop(columns=["_vals", "_disc"]),
-                             hide_index=True, use_container_width=True)
+                             hide_index=True)
                 st.caption("Cabeçalho: `" + res["lines"][0] + "`  |  Rodapé: `" + res["lines"][-1] + "`")
 
             with st.expander("Inspetor de posições (confira com o manual)"):
@@ -515,7 +532,7 @@ for i, (tab, f) in enumerate(zip(tabs, files)):
                 tab_rows.append({"Ordem": 73, "Campo": "Discriminação dos serviços", "Início": ini,
                                  "Fim": ini + len(rec["_disc"]) - 1, "Tam.": len(rec["_disc"]),
                                  "Conteúdo": f"[{rec['_disc']}]"})
-                st.dataframe(pd.DataFrame(tab_rows), hide_index=True, use_container_width=True, height=380)
+                st.dataframe(pd.DataFrame(tab_rows), hide_index=True, height=380)
         except Exception as e:
             st.error(f"Falha ao converter **{f.name}**: {e}")
 
