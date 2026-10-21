@@ -48,6 +48,7 @@ MAX_BYTES = 10240 * 1024          # limite do manual (10 MB)
 VERSAO = "004"                    # leiaute sempre v004
 RESERVADO = 145                   # campo reservado (ordem 72) sempre 145
 SOMENTE_DATA = True               # Data Hora NFE: grava só a data (hora = 000000)
+TIPO_RPS_NFTS = "RPS"             # Tipo de RPS (ordem 5) gravado nas NFTS
 ZERO_SITUACOES = {"C", "E", "S"}  # canceladas, extraviadas, substituídas
 # Todos os campos monetários são zerados nessas situações
 ZERO_FIELDS = (
@@ -319,7 +320,8 @@ COMMON = [
 def nfts_to_nfse(r, base_data="emissao"):
     """Converte linha de NFTS no modelo NFS-e recebida.
     base_data: 'emissao' ou 'fato'. A data escolhida é gravada nas duas datas
-    do TXT (ordem 3 - Data Hora NFE e ordem 8 - Data de emissão do RPS)."""
+    do TXT (ordem 3 - Data Hora NFE e ordem 8 - Data de emissão do RPS).
+    O Tipo de RPS (ordem 5) é sempre preenchido (o importador não aceita em branco)."""
     g = lambda k: clean(r.get(k, ""))
     out = {k: g(k) for k in COMMON}
     serie = g("Série do Documento")
@@ -339,6 +341,7 @@ def nfts_to_nfse(r, base_data="emissao"):
     out.update({
         "Nº NFS-e": g("Nº NFTS"),
         "Data Hora NFE": data_ref,                    # ordem 3
+        "Tipo de RPS": TIPO_RPS_NFTS,                 # ordem 5
         "Série do RPS": "" if serie.strip() in ("-", "--") else serie,
         "Número do RPS": g("Número do Documento"),
         "Data do Fato Gerador": data_ref,             # ordem 8 (mesma data da ordem 3)
@@ -405,6 +408,20 @@ def contrib_im(rows, role):
     return c.most_common(1)[0][0].rjust(8, "0")[:8] if c else ""
 
 
+# ───────────────────── Filtro por período ─────────────────────
+def filter_period(rows, d1, d2):
+    """Mantém só as notas cuja Data Hora NFE (ordem 3) está entre d1 e d2, inclusive.
+    Notas sem data válida ficam de fora."""
+    dentro, fora = [], []
+    for r in rows:
+        dt = parse_dt(get(r, "Data Hora NFE"))
+        if dt and d1 <= dt.date() <= d2:
+            dentro.append(r)
+        else:
+            fora.append(r)
+    return dentro, fora
+
+
 # ───────────────────── Geração do TXT ─────────────────────
 def must_zero(r):
     """Cancelada (C), extraviada (E) ou substituída (S) -> todos os valores zerados."""
@@ -446,7 +463,8 @@ def convert(rows, im, d1, d2):
         n_zero += zeroed
         for i, o in enumerate((27, 28, 31, 32)):
             tot[i] += int(vals[o])
-        recs.append({"Nº": num, "Emissão": vals[3][:8], "Data RPS": vals[8].strip(),
+        recs.append({"Nº": num, "Emissão": vals[3][:8], "Tipo RPS": vals[5].strip(),
+                     "Data RPS": vals[8].strip(),
                      "Situação": vals[23].strip(),
                      "Zerada": "Sim" if zeroed else "",
                      "Valor serviços": br(int(vals[27])), "ISS": br(int(vals[31])),
@@ -482,8 +500,10 @@ with st.sidebar:
     st.caption("Parâmetros fixos: leiaute **v004**, campo reservado de **145** posições, "
                "todos os valores zerados nas notas **C**, **E** e **S**, "
                "data de emissão gravada **sem hora** (000000). "
-               "Na **NFTS**, as duas datas do TXT (Data/Hora NFE e Data do RPS) "
-               "são iguais, conforme a escolha feita na aba.")
+               "Na **NFTS**, o Tipo de RPS é gravado como **RPS** e as duas datas do TXT "
+               "(Data/Hora NFE e Data do RPS) são iguais, conforme a escolha feita na aba. "
+               "O TXT contém **somente as notas do período selecionado** "
+               "(filtro pela Data/Hora NFE, início e fim inclusive).")
 
 files = st.file_uploader("Selecione os CSVs (NFS-e prestados, NFS-e tomados e/ou NFTS)",
                          type=["csv"], accept_multiple_files=True)
@@ -529,14 +549,27 @@ for i, (tab, f) in enumerate(zip(tabs, files)):
                 dmin, dmax = nome_per
             with c3:
                 p1, p2 = st.columns(2)
-                d1 = p1.date_input("Início do período", dmin, key=f"d1_{i}_{role}", format="DD/MM/YYYY")
-                d2 = p2.date_input("Fim do período", dmax, key=f"d2_{i}_{role}", format="DD/MM/YYYY")
+                d1 = p1.date_input("Início do período", dmin,
+                                   key=f"d1_{i}_{role}_{base_data}", format="DD/MM/YYYY")
+                d2 = p2.date_input("Fim do período", dmax,
+                                   key=f"d2_{i}_{role}_{base_data}", format="DD/MM/YYYY")
 
             if not im.strip():
                 st.error("Informe a Inscrição Municipal do contribuinte para o cabeçalho.")
                 continue
 
-            res = convert(canon, im, d1, d2)
+            if d1 > d2:
+                st.error("O início do período não pode ser maior que o fim.")
+                continue
+
+            # Somente as notas do período selecionado entram no TXT
+            canon_per, fora = filter_period(canon, d1, d2)
+            if not canon_per:
+                st.warning("Nenhuma nota com data dentro do período selecionado. "
+                           "Ajuste o período ou a data escolhida.")
+                continue
+
+            res = convert(canon_per, im, d1, d2)
 
             # nome do arquivo: IM + período (único dentro do ZIP)
             fname = out_name(f.name, im, d1, d2)
@@ -549,10 +582,11 @@ for i, (tab, f) in enumerate(zip(tabs, files)):
             res["fname"] = fname
             results[f.name] = res
 
-            m1 = st.columns(3)
+            m1 = st.columns(4)
             m1[0].metric("Origem", "NFTS → recebidas" if kind == "NFTS" else "NFS-e")
             m1[1].metric("Linhas de detalhe", res["n"])
             m1[2].metric("Notas zeradas (C/E/S)", res["n_zero"])
+            m1[3].metric("Fora do período (excluídas)", len(fora))
             m2 = st.columns(3)
             m2[0].metric("Σ Valor dos serviços", br(res["tot"][0]))
             m2[1].metric("Σ ISS", br(res["tot"][2]))
@@ -568,6 +602,17 @@ for i, (tab, f) in enumerate(zip(tabs, files)):
 
             st.download_button(f"⬇️ Baixar {fname}", res["txt_bytes"], file_name=fname,
                                mime="text/plain", key=f"dl_{i}")
+
+            if fora:
+                with st.expander(f"Notas fora do período ({len(fora)}) – não incluídas no TXT"):
+                    linhas_fora = []
+                    for r in fora:
+                        dt = parse_dt(get(r, "Data Hora NFE"))
+                        linhas_fora.append({
+                            "Nº": digits(get(r, "Nº NFS-e")),
+                            "Data (ordem 3)": dt.strftime("%d/%m/%Y") if dt else "sem data",
+                        })
+                    st.dataframe(pd.DataFrame(linhas_fora), hide_index=True)
 
             with st.expander("Pré-visualização dos registros"):
                 st.dataframe(pd.DataFrame(res["recs"]).drop(columns=["_vals", "_disc"]),
