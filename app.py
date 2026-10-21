@@ -57,6 +57,10 @@ ZERO_FIELDS = (
     "Carga tributária: Valor", "Valor Total Recebido",
 )
 
+# Opções de data para NFTS (ordens 3 e 8 do TXT ficam iguais)
+OPC_EMISSAO = "Data de emissão da NFTS"
+OPC_FATO = "Data do fato gerador (prestação do serviço)"
+
 # Data AAAAMMDD válida (2000-2099) e par de datas AAAAMMDD_AAAAMMDD no nome do arquivo.
 # Evita confundir a IM (ex.: 11467690) com uma data.
 DATE8 = r"20\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])"
@@ -312,7 +316,10 @@ COMMON = [
 ]
 
 
-def nfts_to_nfse(r):
+def nfts_to_nfse(r, base_data="emissao"):
+    """Converte linha de NFTS no modelo NFS-e recebida.
+    base_data: 'emissao' ou 'fato'. A data escolhida é gravada nas duas datas
+    do TXT (ordem 3 - Data Hora NFE e ordem 8 - Data de emissão do RPS)."""
     g = lambda k: clean(r.get(k, ""))
     out = {k: g(k) for k in COMMON}
     serie = g("Série do Documento")
@@ -325,12 +332,16 @@ def nfts_to_nfse(r):
         situacao = "S"          # nota substituída (remova este elif se não quiser)
     else:
         situacao = g("Tributação do Serviço")
+
+    data_ref = (g("Data da Prestação de Serviços") if base_data == "fato"
+                else g("Data Hora Emissão NFTS"))
+
     out.update({
         "Nº NFS-e": g("Nº NFTS"),
-        "Data Hora NFE": g("Data Hora Emissão NFTS"),
+        "Data Hora NFE": data_ref,                    # ordem 3
         "Série do RPS": "" if serie.strip() in ("-", "--") else serie,
         "Número do RPS": g("Número do Documento"),
-        "Data do Fato Gerador": g("Data da Prestação de Serviços"),
+        "Data do Fato Gerador": data_ref,             # ordem 8 (mesma data da ordem 3)
         "Opção Pelo Simples": g("Regime de Tributação"),
         "Situação da Nota Fiscal": situacao,
         "Data de Quitação da Guia Vinculada a Nota Fiscal": g("Data de Quitação da Guia Vinculada a NFS-e"),
@@ -435,7 +446,8 @@ def convert(rows, im, d1, d2):
         n_zero += zeroed
         for i, o in enumerate((27, 28, 31, 32)):
             tot[i] += int(vals[o])
-        recs.append({"Nº": num, "Emissão": vals[3][:8], "Situação": vals[23].strip(),
+        recs.append({"Nº": num, "Emissão": vals[3][:8], "Data RPS": vals[8].strip(),
+                     "Situação": vals[23].strip(),
                      "Zerada": "Sim" if zeroed else "",
                      "Valor serviços": br(int(vals[27])), "ISS": br(int(vals[31])),
                      "Crédito": br(int(vals[32])), "Tam. linha": len(line),
@@ -469,7 +481,9 @@ with st.sidebar:
         st.image(logo)
     st.caption("Parâmetros fixos: leiaute **v004**, campo reservado de **145** posições, "
                "todos os valores zerados nas notas **C**, **E** e **S**, "
-               "data de emissão gravada **sem hora** (000000).")
+               "data de emissão gravada **sem hora** (000000). "
+               "Na **NFTS**, as duas datas do TXT (Data/Hora NFE e Data do RPS) "
+               "são iguais, conforme a escolha feita na aba.")
 
 files = st.file_uploader("Selecione os CSVs (NFS-e prestados, NFS-e tomados e/ou NFTS)",
                          type=["csv"], accept_multiple_files=True)
@@ -485,7 +499,16 @@ for i, (tab, f) in enumerate(zip(tabs, files)):
         try:
             header, rows, merged = read_table(decode(f.getvalue()))
             kind = "NFTS" if "Nº NFTS" in header else "NFS-e"
-            canon = [nfts_to_nfse(r) for r in rows] if kind == "NFTS" else rows
+
+            # Escolha da data (somente NFTS): as duas datas do TXT ficam iguais
+            base_data = "emissao"
+            if kind == "NFTS":
+                escolha = st.radio(
+                    "Data a usar nas duas datas do TXT (Data/Hora NFE e Data de emissão do RPS)",
+                    [OPC_EMISSAO, OPC_FATO], horizontal=True, key=f"data_{i}")
+                base_data = "fato" if escolha == OPC_FATO else "emissao"
+
+            canon = [nfts_to_nfse(r, base_data) for r in rows] if kind == "NFTS" else rows
             if not canon:
                 st.warning("Nenhum registro de detalhe encontrado.")
                 continue
