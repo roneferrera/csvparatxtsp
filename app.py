@@ -56,6 +56,11 @@ ZERO_FIELDS = (
     "Carga tributária: Valor", "Valor Total Recebido",
 )
 
+# Data AAAAMMDD válida (2000-2099) e par de datas AAAAMMDD_AAAAMMDD no nome do arquivo.
+# Evita confundir a IM (ex.: 11467690) com uma data.
+DATE8 = r"20\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])"
+PERIOD_RE = re.compile(rf"(?<!\d)({DATE8})_({DATE8})(?!\d)")
+
 
 # ───────────────────── Utilidades de formatação ─────────────────────
 class Ctx:
@@ -106,7 +111,7 @@ def parse_dt(v):
 
 def period_from_name(name):
     """Período AAAAMMDD_AAAAMMDD no nome do arquivo (ex.: NFTS_11467690_20260901_20260930.csv)."""
-    m = re.search(r"(\d{8})_(\d{8})", name)
+    m = PERIOD_RE.search(name)
     if not m:
         return None
     try:
@@ -438,10 +443,18 @@ def convert(rows, im, d1, d2):
             "n": n, "n_zero": n_zero, "warnings": ctx.warnings, "lines": lines}
 
 
-def out_name(name):
+def out_name(name, im, d1, d2):
+    """TXT v004 - <nome> IM <8 dígitos> <DDMMAAAA_DDMMAAAA>.txt"""
+    im8 = digits(im).rjust(8, "0")[:8]
+    core = im8.lstrip("0") or im8
     base = re.sub(r"\.csv$", "", name, flags=re.I)
-    base = re.sub(r"^CSV\s*-\s*", "", base, flags=re.I)
-    return f"TXT v004 - {base}.txt"
+    base = re.sub(r"^(CSV|TXT)\s*-\s*", "", base, flags=re.I)
+    base = PERIOD_RE.sub("", base)                                        # período AAAAMMDD_AAAAMMDD
+    base = re.sub(rf"[_\s-]*(?<!\d){re.escape(core)}(?!\d)", "", base)    # IM repetida no nome
+    base = re.sub(r'[\\/:*?"<>|]+', " ", base).strip(" _-")
+    base = base or "NOTAS"
+    periodo = f"{d1:%d%m%Y}_{d2:%d%m%Y}"
+    return f"TXT v004 - {base} IM {im8} {periodo}.txt"
 
 
 # ───────────────────── Sidebar ─────────────────────
@@ -450,6 +463,8 @@ with st.sidebar:
     logo = st.file_uploader("Logo (opcional)", type=["png", "jpg", "jpeg"])
     if logo:
         st.image(logo)
+    st.caption("Parâmetros fixos: leiaute **v004**, campo reservado de **145** posições, "
+               "todos os valores zerados nas notas **C**, **E** e **S**.")
 
 files = st.file_uploader("Selecione os CSVs (NFS-e prestados, NFS-e tomados e/ou NFTS)",
                          type=["csv"], accept_multiple_files=True)
@@ -458,6 +473,7 @@ if not files:
     st.stop()
 
 results = {}
+used_names = set()
 tabs = st.tabs([f.name for f in files])
 for i, (tab, f) in enumerate(zip(tabs, files)):
     with tab:
@@ -493,8 +509,17 @@ for i, (tab, f) in enumerate(zip(tabs, files)):
                 continue
 
             res = convert(canon, im, d1, d2)
+
+            # nome do arquivo: IM + período (único dentro do ZIP)
+            fname = out_name(f.name, im, d1, d2)
+            if fname in used_names:
+                stem, k = fname[:-4], 2
+                while f"{stem} ({k}).txt" in used_names:
+                    k += 1
+                fname = f"{stem} ({k}).txt"
+            used_names.add(fname)
+            res["fname"] = fname
             results[f.name] = res
-            fname = out_name(f.name)
 
             m1 = st.columns(3)
             m1[0].metric("Origem", "NFTS → recebidas" if kind == "NFTS" else "NFS-e")
@@ -540,7 +565,7 @@ if len(results) > 1:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         for name, res in results.items():
-            z.writestr(out_name(name), res["txt_bytes"])
+            z.writestr(res["fname"], res["txt_bytes"])
     st.divider()
     st.download_button("⬇️ Baixar todos (ZIP)", buf.getvalue(),
                        file_name="NFSe_NFTS_TXT_v004.zip", mime="application/zip")
