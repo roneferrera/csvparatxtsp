@@ -469,6 +469,25 @@ def split_retencoes(r):
     return r, "desmembrada"
 
 
+# ───────────────────── Cliente estrangeiro (Prestados: T -> P) ─────────────────────
+def is_estrangeiro(r):
+    """Tomador sem CPF/CNPJ e sem UF (ou UF = EX): tratado como cliente estrangeiro."""
+    doc = digits(get(r, "CPF/CNPJ do Tomador")).strip("0")
+    uf = clean(get(r, "UF do Tomador")).strip().upper()
+    return not doc and uf in ("", "EX")
+
+
+def aplicar_exportacao(r):
+    """Prestados: situação T + cliente estrangeiro -> P (Exportação de Serviços).
+    Retorna (linha, alterada?)."""
+    r = dict(r)
+    sit = clean(get(r, "Situação da Nota Fiscal")).strip().upper()
+    if sit == "T" and is_estrangeiro(r):
+        r["Situação da Nota Fiscal"] = "P"
+        return r, True
+    return r, False
+
+
 # ───────────────────── Filtros ─────────────────────
 def filter_period(rows, d1, d2):
     """Mantém só as notas cuja Data Hora NFE (ordem 3) está entre d1 e d2, inclusive.
@@ -586,7 +605,9 @@ with st.sidebar:
                "(filtro pela Data/Hora NFE, início e fim inclusive). "
                "Em **Tomados** e em **NFTS**, notas **canceladas não geram linha**. "
                "Nas **NFS-e** emitidas a partir de 14/05/2026, as retenções agregadas de "
-               "PIS/COFINS/CSLL podem ser **desmembradas** (opção na aba).")
+               "PIS/COFINS/CSLL podem ser **desmembradas** (opção na aba). "
+               "Em **NFS-e Prestados**, clientes sem CNPJ/CPF e UF podem ser tratados como "
+               "**estrangeiros** (situação T alterada para P, opção na aba).")
 
 files = st.file_uploader("Selecione os CSVs (NFS-e prestados, NFS-e tomados e/ou NFTS)",
                          type=["csv"], accept_multiple_files=True)
@@ -653,6 +674,15 @@ for i, (tab, f) in enumerate(zip(tabs, files)):
                 d2 = p2.date_input("Fim do período", dmax,
                                    key=f"d2_{i}_{role}_{base_data}", format="DD/MM/YYYY")
 
+            # Cliente estrangeiro (somente NFS-e Prestados): opção da aba
+            usar_exp = False
+            if role == "Prestados" and kind == "NFS-e":
+                usar_exp = st.checkbox(
+                    "Cliente sem CNPJ/CPF e UF = estrangeiro: alterar situação de T para P (Exportação)",
+                    value=False, key=f"exp_{i}",
+                    help="Replica a opção do Domínio: considera o cliente como estrangeiro quando "
+                         "não há Inscrição Federal e UF no arquivo.")
+
             if not im.strip():
                 st.error("Informe a Inscrição Municipal do contribuinte para o cabeçalho.")
                 continue
@@ -674,6 +704,13 @@ for i, (tab, f) in enumerate(zip(tabs, files)):
                 st.warning("Nenhuma nota com data dentro do período selecionado "
                            "(ou todas canceladas). Ajuste o período ou a data escolhida.")
                 continue
+
+            # Cliente estrangeiro: T -> P (aplicado só às notas que vão para o TXT)
+            exp_notas = []
+            if usar_exp:
+                res_exp = [aplicar_exportacao(r) for r in canon_per]
+                canon_per = [x[0] for x in res_exp]
+                exp_notas = [x[0] for x in res_exp if x[1]]
 
             res = convert(canon_per, im, d1, d2)
 
@@ -736,6 +773,19 @@ for i, (tab, f) in enumerate(zip(tabs, files)):
                     st.warning("Notas com valor de retenção que não bate com nenhuma combinação de "
                                "PIS/COFINS/CSLL (mantidas como vieram, conferir): "
                                + ", ".join(sem_corr[:30]) + ("…" if len(sem_corr) > 30 else ""))
+
+            # Resultado da regra de cliente estrangeiro
+            if usar_exp:
+                if exp_notas:
+                    st.info(f"{len(exp_notas)} nota(s) alterada(s) de T para P (cliente estrangeiro).")
+                    with st.expander(f"Notas alteradas para P ({len(exp_notas)})"):
+                        st.dataframe(pd.DataFrame([{
+                            "Nº": digits(get(r, "Nº NFS-e")),
+                            "Tomador": clean(get(r, "Razão Social do Tomador")).strip(),
+                            "Valor serviços": br(cents(get(r, "Valor dos Serviços")) or 0),
+                        } for r in exp_notas]), hide_index=True)
+                else:
+                    st.caption("Cliente estrangeiro: nenhuma nota T sem CNPJ/CPF e UF no período.")
 
             if len(res["txt_bytes"]) > MAX_BYTES:
                 st.error("O arquivo gerado excede 10 MB (limite do manual). Divida por período.")
