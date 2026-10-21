@@ -47,6 +47,7 @@ CRLF = "\r\n"
 MAX_BYTES = 10240 * 1024          # limite do manual (10 MB)
 VERSAO = "004"                    # leiaute sempre v004
 RESERVADO = 145                   # campo reservado (ordem 72) sempre 145
+SOMENTE_DATA = True               # Data Hora NFE: grava só a data (hora = 000000)
 ZERO_SITUACOES = {"C", "E", "S"}  # canceladas, extraviadas, substituídas
 # Todos os campos monetários são zerados nessas situações
 ZERO_FIELDS = (
@@ -155,7 +156,10 @@ def fmt(kind, value, width, default, ctx, nome):
         dt = parse_dt(value)
         if not dt:
             return " " * width
-        return dt.strftime("%Y%m%d" if kind == "D" else "%Y%m%d%H%M%S")
+        if kind == "D":
+            return dt.strftime("%Y%m%d")
+        hora = "000000" if SOMENTE_DATA else dt.strftime("%H%M%S")
+        return dt.strftime("%Y%m%d") + hora
     if kind == "SN":
         return "S" if clean(value).strip().upper()[:1] in ("S", "1") else "N"
     if kind in ("N", "NS"):
@@ -464,7 +468,8 @@ with st.sidebar:
     if logo:
         st.image(logo)
     st.caption("Parâmetros fixos: leiaute **v004**, campo reservado de **145** posições, "
-               "todos os valores zerados nas notas **C**, **E** e **S**.")
+               "todos os valores zerados nas notas **C**, **E** e **S**, "
+               "data de emissão gravada **sem hora** (000000).")
 
 files = st.file_uploader("Selecione os CSVs (NFS-e prestados, NFS-e tomados e/ou NFTS)",
                          type=["csv"], accept_multiple_files=True)
