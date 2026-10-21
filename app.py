@@ -5,10 +5,10 @@ import unicodedata
 import zipfile
 from collections import Counter
 from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 
 import pandas as pd
 import streamlit as st
-from decimal import Decimal, InvalidOperation
 
 st.set_page_config(page_title="Conversor NFS-e / NFTS | TXT v004 SP",
                    page_icon="🟠", layout="wide")
@@ -38,8 +38,19 @@ section[data-testid="stSidebar"]{border-right:3px solid #FA6400;}
 </div>
 """, unsafe_allow_html=True)
 
+# ───────────────────── Parâmetros fixos ─────────────────────
 CRLF = "\r\n"
-MAX_BYTES = 10240 * 1024  # limite do manual (10 MB)
+MAX_BYTES = 10240 * 1024          # limite do manual (10 MB)
+VERSAO = "004"                    # leiaute sempre v004
+RESERVADO = 145                   # campo reservado (ordem 72) sempre 145
+ZERO_SITUACOES = {"C", "E", "S"}  # canceladas, extraviadas, substituídas
+# Todos os campos monetários são zerados nessas situações
+ZERO_FIELDS = (
+    "Valor dos Serviços", "Valor das Deduções", "ISS devido", "Valor do Crédito",
+    "ISS recolhido", "ISS a recolher", "Repasse do Plano de Saúde",
+    "PIS/PASEP", "COFINS", "INSS", "IR", "CSLL",
+    "Carga tributária: Valor", "Valor Total Recebido",
+)
 
 
 # ───────────────────── Utilidades de formatação ─────────────────────
@@ -90,7 +101,7 @@ def parse_dt(v):
 
 
 def latin1_safe(s):
-    """Garante que 1 caractere = 1 byte em ISO-8859-1 (necessário p/ largura fixa)."""
+    """Garante 1 caractere = 1 byte em ISO-8859-1 (necessário p/ largura fixa)."""
     out = []
     for ch in s:
         try:
@@ -225,7 +236,7 @@ SPEC = [
     (69, "Valor total recebido", 15, "MS", "Valor Total Recebido", None),
     (70, "Tipo de consolidação", 1, "NS", "Tipo de Consolidação", None),
     (71, "Nº NFS-e consolidada", 12, "NS", "Nº NFS-e Consolidada", None),
-    (72, "Campo reservado", 132, "BLANK", None, None),
+    (72, "Campo reservado", RESERVADO, "BLANK", None, None),
 ]
 ALIASES = {
     "ISS recolhido": ["ISS pago"],
@@ -236,20 +247,20 @@ ALIASES = {
 }
 
 
-def positions(reservado=132):
+def positions():
     out, start = [], 1
     for ordem, nome, w, *_ in SPEC:
-        if ordem == 72:
-            w = reservado
         out.append((ordem, nome, start, start + w - 1, w))
         start += w
     return out
 
 
-# Autoconferência com o manual (posições finais)
-_CHECK = {9: 69, 21: 417, 33: 517, 47: 885, 55: 1036, 60: 1111, 68: 1212, 70: 1228, 71: 1240, 72: 1372}
+# Autoconferência com o manual (posições finais até a ordem 71 + reservado de 145)
+_CHECK = {9: 69, 21: 417, 33: 517, 47: 885, 55: 1036, 60: 1111, 68: 1212, 70: 1228,
+          71: 1240, 72: 1240 + RESERVADO}
 _p = {o: fim for o, _, _, fim, _ in positions()}
 assert all(_p[k] == v for k, v in _CHECK.items()), "SPEC não confere com o manual"
+BASE_LEN = 1240 + RESERVADO       # tamanho da linha sem a discriminação
 
 
 def get(row, key):
@@ -281,7 +292,14 @@ def nfts_to_nfse(r):
     out = {k: g(k) for k in COMMON}
     serie = g("Série do Documento")
     nsub = digits(g("Nota Substituta"))
+    tem_sub = bool(nsub) and int(nsub) != 0
     iss, guia = g("Valor ISS"), g("ISS Recolhido por Guia NFS-e")
+    if g("Data de Cancelamento").strip():
+        situacao = "C"
+    elif tem_sub:
+        situacao = "S"          # nota substituída (remova este elif se não quiser)
+    else:
+        situacao = g("Tributação do Serviço")
     out.update({
         "Nº NFS-e": g("Nº NFTS"),
         "Data Hora NFE": g("Data Hora Emissão NFTS"),
@@ -289,12 +307,12 @@ def nfts_to_nfse(r):
         "Número do RPS": g("Número do Documento"),
         "Data do Fato Gerador": g("Data da Prestação de Serviços"),
         "Opção Pelo Simples": g("Regime de Tributação"),
-        "Situação da Nota Fiscal": "C" if g("Data de Cancelamento").strip() else g("Tributação do Serviço"),
+        "Situação da Nota Fiscal": situacao,
         "Data de Quitação da Guia Vinculada a Nota Fiscal": g("Data de Quitação da Guia Vinculada a NFS-e"),
         "Código do Serviço Prestado na Nota Fiscal": g("Código do Serviço Prestado na NFTS"),
         "ISS devido": iss,
         "Valor do Crédito": "0,00",
-        "Nº NFS-e Substituta": "" if (not nsub or int(nsub) == 0) else nsub,
+        "Nº NFS-e Substituta": nsub if tem_sub else "",
         "ISS recolhido": guia,
         "ISS a recolher": "0,00" if (cents(guia) or 0) > 0 else iss,
     })
@@ -328,7 +346,7 @@ def read_table(text):
             r = r[:n - 1] + [delim.join(r[n - 1:])]
         elif len(r) < n:
             r = r + [""] * (n - len(r))
-        if clean(r[0]).strip().lower() == "total":   # totalizador do CSV (será recalculado)
+        if clean(r[0]).strip().lower() == "total":   # totalizador do CSV (recalculado)
             continue
         rows.append(dict(zip(header, r)))
     return header, rows, merged
@@ -352,16 +370,20 @@ def contrib_im(rows, role):
 
 
 # ───────────────────── Geração do TXT ─────────────────────
-def build_detail(r, ctx, zero_cancel, reservado):
-    r = dict(r)
+def must_zero(r):
+    """Cancelada (C), extraviada (E) ou substituída (S) -> todos os valores zerados."""
     sit = clean(get(r, "Situação da Nota Fiscal")).strip().upper()
-    if zero_cancel and sit in ("C", "E"):
-        for k in ("Valor dos Serviços", "Valor das Deduções", "ISS devido", "Valor do Crédito"):
+    return sit in ZERO_SITUACOES or bool(clean(get(r, "Data de Cancelamento")).strip())
+
+
+def build_detail(r, ctx):
+    r = dict(r)
+    zeroed = must_zero(r)
+    if zeroed:
+        for k in ZERO_FIELDS:
             r[k] = "0,00"
     parts, vals = [], {}
     for ordem, nome, w, tipo, src, default in SPEC:
-        if ordem == 72:
-            w = reservado
         s = fmt(tipo, get(r, src) if src else "", w, default, ctx, nome)
         assert len(s) == w, (nome, len(s), w)
         parts.append(s)
@@ -371,30 +393,33 @@ def build_detail(r, ctx, zero_cancel, reservado):
     if len(d) > 1000:
         ctx.warn("Discriminação truncada em 1000 caracteres")
         d = d[:1000]
-    return "".join(parts) + d, vals, d
+    return "".join(parts) + d, vals, d, zeroed
 
 
-def convert(rows, im, d1, d2, version, zero_cancel, reservado):
+def convert(rows, im, d1, d2):
     ctx = Ctx()
-    lines = ["1" + version[:3].rjust(3, "0") + im.rjust(8, "0")[:8] + d1.strftime("%Y%m%d") + d2.strftime("%Y%m%d")]
-    recs, tot = [], [0, 0, 0, 0]
+    lines = ["1" + VERSAO + im.rjust(8, "0")[:8] + d1.strftime("%Y%m%d") + d2.strftime("%Y%m%d")]
+    recs, tot, n_zero = [], [0, 0, 0, 0], 0
     for r in rows:
         num = digits(get(r, "Nº NFS-e"))
         ctx.cur = f"Nota {num or '?'}"
-        line, vals, disc = build_detail(r, ctx, zero_cancel, reservado)
-        if len(line) != 1372 - (132 - reservado) * -1 + len(disc) - 0 and len(line) != (1240 + reservado + len(disc)):
+        line, vals, disc, zeroed = build_detail(r, ctx)
+        if len(line) != BASE_LEN + len(disc):
             ctx.warn(f"tamanho inesperado da linha ({len(line)})")
         lines.append(line)
+        n_zero += zeroed
         for i, o in enumerate((27, 28, 31, 32)):
             tot[i] += int(vals[o])
         recs.append({"Nº": num, "Emissão": vals[3][:8], "Situação": vals[23].strip(),
+                     "Zerada": "Sim" if zeroed else "",
                      "Valor serviços": br(int(vals[27])), "ISS": br(int(vals[31])),
-                     "Crédito": br(int(vals[32])), "Tam. linha": len(line), "_vals": vals, "_disc": disc})
+                     "Crédito": br(int(vals[32])), "Tam. linha": len(line),
+                     "_vals": vals, "_disc": disc})
     n = len(rows)
     lines.append("9" + str(n).rjust(7, "0") + "".join(str(t).rjust(15, "0") for t in tot))
     txt = CRLF.join(lines) + CRLF
     return {"txt_bytes": txt.encode("latin-1", errors="replace"), "recs": recs, "tot": tot,
-            "n": n, "warnings": ctx.warnings, "lines": lines}
+            "n": n, "n_zero": n_zero, "warnings": ctx.warnings, "lines": lines}
 
 
 def out_name(name):
@@ -406,15 +431,13 @@ def out_name(name):
 # ───────────────────── Sidebar ─────────────────────
 with st.sidebar:
     st.header("Opções")
-    version = st.text_input("Versão no cabeçalho (registro 1)", "004", max_chars=3)
-    zero_cancel = st.checkbox("Zerar valores de notas canceladas/extraviadas (C/E)", False,
-                              help="O manual permite zeros nos 15 dígitos do valor dos serviços nessas situações.")
-    res_opt = st.radio("Campo reservado (ordem 72)",
-                       ["132 posições (1241–1372; discriminação em 1373)", "145 posições (tamanho citado no manual)"])
-    reservado = 132 if res_opt.startswith("132") else 145
     logo = st.file_uploader("Logo (opcional)", type=["png", "jpg", "jpeg"])
     if logo:
         st.image(logo, use_container_width=True)
+    st.caption(
+        f"Parâmetros fixos: leiaute **v{VERSAO}**, campo reservado de **{RESERVADO}** posições, "
+        "todos os valores zerados nas notas **C**, **E** e **S**."
+    )
 
 files = st.file_uploader("Selecione os CSVs (NFS-e prestados, NFS-e tomados e/ou NFTS)",
                          type=["csv"], accept_multiple_files=True)
@@ -453,16 +476,17 @@ for i, (tab, f) in enumerate(zip(tabs, files)):
                 st.error("Informe a Inscrição Municipal do contribuinte para o cabeçalho.")
                 continue
 
-            res = convert(canon, im, d1, d2, version, zero_cancel, reservado)
+            res = convert(canon, im, d1, d2)
             results[f.name] = res
             fname = out_name(f.name)
 
-            m = st.columns(5)
+            m = st.columns(6)
             m[0].metric("Origem", "NFTS → recebidas" if kind == "NFTS" else "NFS-e")
             m[1].metric("Linhas de detalhe", res["n"])
-            m[2].metric("Σ Valor dos serviços", br(res["tot"][0]))
-            m[3].metric("Σ ISS", br(res["tot"][2]))
-            m[4].metric("Σ Crédito", br(res["tot"][3]))
+            m[2].metric("Notas zeradas (C/E/S)", res["n_zero"])
+            m[3].metric("Σ Valor dos serviços", br(res["tot"][0]))
+            m[4].metric("Σ ISS", br(res["tot"][2]))
+            m[5].metric("Σ Crédito", br(res["tot"][3]))
 
             if len(res["txt_bytes"]) > MAX_BYTES:
                 st.error("O arquivo gerado excede 10 MB (limite do manual). Divida por período.")
@@ -483,7 +507,7 @@ for i, (tab, f) in enumerate(zip(tabs, files)):
             with st.expander("Inspetor de posições (confira com o manual)"):
                 idx = st.selectbox("Registro", range(len(res["recs"])), key=f"insp_{i}",
                                    format_func=lambda k: f"Nota {res['recs'][k]['Nº']}")
-                rec, pos, tab_rows = res["recs"][idx], positions(reservado), []
+                rec, pos, tab_rows = res["recs"][idx], positions(), []
                 for ordem, nome, ini, fim, w in pos:
                     tab_rows.append({"Ordem": ordem, "Campo": nome, "Início": ini, "Fim": fim,
                                      "Tam.": w, "Conteúdo": f"[{rec['_vals'][ordem]}]"})
