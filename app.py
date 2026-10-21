@@ -469,7 +469,7 @@ def split_retencoes(r):
     return r, "desmembrada"
 
 
-# ───────────────────── Filtro por período ─────────────────────
+# ───────────────────── Filtros ─────────────────────
 def filter_period(rows, d1, d2):
     """Mantém só as notas cuja Data Hora NFE (ordem 3) está entre d1 e d2, inclusive.
     Notas sem data válida ficam de fora."""
@@ -481,6 +481,12 @@ def filter_period(rows, d1, d2):
         else:
             fora.append(r)
     return dentro, fora
+
+
+def is_cancelada(r):
+    """Cancelada: situação 'C' ou data de cancelamento preenchida."""
+    sit = clean(get(r, "Situação da Nota Fiscal")).strip().upper()
+    return sit == "C" or bool(clean(get(r, "Data de Cancelamento")).strip())
 
 
 # ───────────────────── Geração do TXT ─────────────────────
@@ -515,6 +521,7 @@ def convert(rows, im, d1, d2):
     lines = ["1" + VERSAO + im.rjust(8, "0")[:8] + d1.strftime("%Y%m%d") + d2.strftime("%Y%m%d")]
     recs, tot, n_zero = [], [0, 0, 0, 0], 0
     ret = {"PIS": 0, "COFINS": 0, "INSS": 0, "IR": 0, "CSSL": 0}
+    iss_ret, n_iss_ret = 0, 0
     for r in rows:
         num = digits(get(r, "Nº NFS-e"))
         ctx.cur = f"Nota {num or '?'}"
@@ -527,11 +534,15 @@ def convert(rows, im, d1, d2):
             tot[i] += int(vals[o])
         for nome_r, o in (("PIS", 56), ("COFINS", 57), ("INSS", 58), ("IR", 59), ("CSSL", 60)):
             ret[nome_r] += int(vals[o]) if vals[o].strip() else 0
+        if vals[33] == "S" and not zeroed:
+            iss_ret += int(vals[31])
+            n_iss_ret += 1
         recs.append({"Nº": num, "Emissão": vals[3][:8], "Tipo RPS": vals[5].strip(),
                      "Data RPS": vals[8].strip(),
                      "Situação": vals[23].strip(),
                      "Zerada": "Sim" if zeroed else "",
                      "Valor serviços": br(int(vals[27])), "ISS": br(int(vals[31])),
+                     "ISS retido": vals[33],
                      "Crédito": br(int(vals[32])),
                      "PIS": br_or_blank(vals[56]), "COFINS": br_or_blank(vals[57]),
                      "CSSL": br_or_blank(vals[60]),
@@ -542,7 +553,8 @@ def convert(rows, im, d1, d2):
     lines.append("9" + str(n).rjust(7, "0") + "".join(str(t).rjust(15, "0") for t in tot))
     txt = CRLF.join(lines) + CRLF
     return {"txt_bytes": txt.encode("latin-1", errors="replace"), "recs": recs, "tot": tot,
-            "ret": ret, "n": n, "n_zero": n_zero, "warnings": ctx.warnings, "lines": lines}
+            "ret": ret, "iss_ret": iss_ret, "n_iss_ret": n_iss_ret,
+            "n": n, "n_zero": n_zero, "warnings": ctx.warnings, "lines": lines}
 
 
 def out_name(name, im, d1, d2):
@@ -572,6 +584,7 @@ with st.sidebar:
                "(Data/Hora NFE e Data do RPS) são iguais, conforme a escolha feita na aba. "
                "O TXT contém **somente as notas do período selecionado** "
                "(filtro pela Data/Hora NFE, início e fim inclusive). "
+               "Em **Tomados** e em **NFTS**, notas **canceladas não geram linha**. "
                "Nas **NFS-e** emitidas a partir de 14/05/2026, as retenções agregadas de "
                "PIS/COFINS/CSLL podem ser **desmembradas** (opção na aba).")
 
@@ -595,7 +608,7 @@ for i, (tab, f) in enumerate(zip(tabs, files)):
             if kind == "NFTS":
                 escolha = st.radio(
                     "Data a usar nas duas datas do TXT (Data/Hora NFE e Data de emissão do RPS)",
-                    [OPC_EMISSAO, OPC_FATO], horizontal=True, key=f"data_{i}")
+                    [OPC_EMISSAO, OPC_FATO], index=1, horizontal=True, key=f"data_{i}")
                 base_data = "fato" if escolha == OPC_FATO else "emissao"
 
             canon = [nfts_to_nfse(r, base_data) for r in rows] if kind == "NFTS" else rows
@@ -650,9 +663,16 @@ for i, (tab, f) in enumerate(zip(tabs, files)):
 
             # Somente as notas do período selecionado entram no TXT
             canon_per, fora = filter_period(canon, d1, d2)
+
+            # Tomados e NFTS: notas canceladas não geram linha
+            canceladas = []
+            if role == "Tomados" or kind == "NFTS":
+                canceladas = [r for r in canon_per if is_cancelada(r)]
+                canon_per = [r for r in canon_per if not is_cancelada(r)]
+
             if not canon_per:
-                st.warning("Nenhuma nota com data dentro do período selecionado. "
-                           "Ajuste o período ou a data escolhida.")
+                st.warning("Nenhuma nota com data dentro do período selecionado "
+                           "(ou todas canceladas). Ajuste o período ou a data escolhida.")
                 continue
 
             res = convert(canon_per, im, d1, d2)
@@ -668,17 +688,23 @@ for i, (tab, f) in enumerate(zip(tabs, files)):
             res["fname"] = fname
             results[f.name] = res
 
-            m1 = st.columns(4)
+            m1 = st.columns(5)
             m1[0].metric("Origem", "NFTS → recebidas" if kind == "NFTS" else "NFS-e")
             m1[1].metric("Linhas de detalhe", res["n"])
             m1[2].metric("Notas zeradas (C/E/S)", res["n_zero"])
-            m1[3].metric("Fora do período (excluídas)", len(fora))
+            m1[3].metric("Canceladas (não geradas)", len(canceladas))
+            m1[4].metric("Fora do período (excluídas)", len(fora))
             m2 = st.columns(3)
             m2[0].metric("Σ Valor dos serviços", br(res["tot"][0]))
             m2[1].metric("Σ ISS", br(res["tot"][2]))
             m2[2].metric("Σ Crédito", br(res["tot"][3]))
 
-            # Somas das retenções (PIS, COFINS, CSLL, INSS, IR)
+            # ISS retido
+            m4 = st.columns(2)
+            m4[0].metric("Σ ISS retido (ISS retido = S)", br(res["iss_ret"]))
+            m4[1].metric("Notas com ISS retido", res["n_iss_ret"])
+
+            # Somas das retenções federais (PIS, COFINS, CSLL, INSS, IR)
             r1 = res["ret"]
             if kind == "NFS-e" or sum(r1.values()) > 0:
                 m3 = st.columns(6)
@@ -721,6 +747,14 @@ for i, (tab, f) in enumerate(zip(tabs, files)):
 
             st.download_button(f"⬇️ Baixar {fname}", res["txt_bytes"], file_name=fname,
                                mime="text/plain", key=f"dl_{i}")
+
+            if canceladas:
+                with st.expander(f"Notas canceladas ({len(canceladas)}) – não incluídas no TXT"):
+                    st.dataframe(pd.DataFrame([{
+                        "Nº": digits(get(r, "Nº NFS-e")),
+                        "Cancelamento": clean(get(r, "Data de Cancelamento")).strip(),
+                        "Valor serviços": br(cents(get(r, "Valor dos Serviços")) or 0),
+                    } for r in canceladas]), hide_index=True)
 
             if fora:
                 with st.expander(f"Notas fora do período ({len(fora)}) – não incluídas no TXT"):
