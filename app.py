@@ -49,6 +49,7 @@ VERSAO = "004"                    # leiaute sempre v004
 RESERVADO = 145                   # campo reservado (ordem 72) sempre 145
 SOMENTE_DATA = True               # Data Hora NFE: grava só a data (hora = 000000)
 TIPO_RPS_NFTS = "RPS"             # Tipo de RPS (ordem 5) gravado nas NFTS
+UF_EXTERIOR = "EX"                # UF gravada para prestador estrangeiro (NFTS)
 ZERO_SITUACOES = {"C", "E", "S"}  # canceladas, extraviadas, substituídas
 # Todos os campos monetários são zerados nessas situações
 ZERO_FIELDS = (
@@ -329,11 +330,19 @@ COMMON = [
 ]
 
 
-def nfts_to_nfse(r, base_data="emissao"):
+def prestador_estrangeiro(r):
+    """Prestador sem CPF/CNPJ (vazio ou só zeros) e sem UF: prestador estrangeiro."""
+    doc = digits(r.get("CPF/CNPJ do Prestador", "")).strip("0")
+    uf = clean(r.get("UF do Prestador", "")).strip()
+    return not doc and not uf
+
+
+def nfts_to_nfse(r, base_data="emissao", ex_prestador=True):
     """Converte linha de NFTS no modelo NFS-e recebida.
     base_data: 'emissao' ou 'fato'. A data escolhida é gravada nas duas datas
     do TXT (ordem 3 - Data Hora NFE e ordem 8 - Data de emissão do RPS).
-    O Tipo de RPS (ordem 5) é sempre preenchido (o importador não aceita em branco)."""
+    O Tipo de RPS (ordem 5) é sempre preenchido (o importador não aceita em branco).
+    ex_prestador: prestador sem CNPJ/CPF e sem UF -> UF = 'EX' e cidade = 'Endereço do Prestador'."""
     g = lambda k: clean(r.get(k, ""))
     out = {k: g(k) for k in COMMON}
     serie = g("Série do Documento")
@@ -367,6 +376,12 @@ def nfts_to_nfse(r, base_data="emissao"):
         "ISS recolhido": guia,
         "ISS a recolher": "0,00" if (cents(guia) or 0) > 0 else iss,
     })
+
+    # Prestador estrangeiro: UF = EX (ordem 19) e município (ordem 18) = dados do endereço
+    if ex_prestador and prestador_estrangeiro(out):
+        out["UF do Prestador"] = UF_EXTERIOR
+        out["Cidade do Prestador"] = clean(out.get("Endereço do Prestador", "")).strip()
+        out["_ex"] = True
     return out
 
 
@@ -563,6 +578,7 @@ def convert(rows, im, d1, d2):
                      "Valor serviços": br(int(vals[27])), "ISS": br(int(vals[31])),
                      "ISS retido": vals[33],
                      "Crédito": br(int(vals[32])),
+                     "Cidade prest.": vals[18].strip(), "UF prest.": vals[19].strip(),
                      "PIS": br_or_blank(vals[56]), "COFINS": br_or_blank(vals[57]),
                      "CSSL": br_or_blank(vals[60]),
                      "Σ PIS+COFINS+CSSL": br(sum(int(vals[o]) for o in (56, 57, 60) if vals[o].strip())),
@@ -601,6 +617,8 @@ with st.sidebar:
                "data de emissão gravada **sem hora** (000000). "
                "Na **NFTS**, o Tipo de RPS é gravado como **RPS** e as duas datas do TXT "
                "(Data/Hora NFE e Data do RPS) são iguais, conforme a escolha feita na aba. "
+               "Na **NFTS**, prestador sem CNPJ/CPF e sem UF é tratado como estrangeiro: "
+               "**UF = EX** e cidade = dados do endereço do prestador (opção na aba). "
                "O TXT contém **somente as notas do período selecionado** "
                "(filtro pela Data/Hora NFE, início e fim inclusive). "
                "Em **Tomados** e em **NFTS**, notas **canceladas não geram linha**. "
@@ -624,15 +642,22 @@ for i, (tab, f) in enumerate(zip(tabs, files)):
             header, rows, merged = read_table(decode(f.getvalue()))
             kind = "NFTS" if "Nº NFTS" in header else "NFS-e"
 
-            # Escolha da data (somente NFTS): as duas datas do TXT ficam iguais
+            # Opções da NFTS: data das ordens 3/8 e prestador estrangeiro
             base_data = "emissao"
+            ex_prest = False
             if kind == "NFTS":
                 escolha = st.radio(
                     "Data a usar nas duas datas do TXT (Data/Hora NFE e Data de emissão do RPS)",
                     [OPC_EMISSAO, OPC_FATO], index=1, horizontal=True, key=f"data_{i}")
                 base_data = "fato" if escolha == OPC_FATO else "emissao"
+                ex_prest = st.checkbox(
+                    "Prestador sem CNPJ/CPF e UF = estrangeiro: UF = EX e cidade = endereço do prestador",
+                    value=True, key=f"exprest_{i}",
+                    help="Quando o prestador não tem CPF/CNPJ nem UF no arquivo, grava UF = EX "
+                         "(ordem 19) e copia o campo 'Endereço do Prestador' para a cidade (ordem 18).")
 
-            canon = [nfts_to_nfse(r, base_data) for r in rows] if kind == "NFTS" else rows
+            canon = ([nfts_to_nfse(r, base_data, ex_prest) for r in rows]
+                     if kind == "NFTS" else rows)
 
             # Retenções federais agregadas (somente NFS-e)
             split_cnt, sem_corr = None, []
@@ -712,6 +737,9 @@ for i, (tab, f) in enumerate(zip(tabs, files)):
                 canon_per = [x[0] for x in res_exp]
                 exp_notas = [x[0] for x in res_exp if x[1]]
 
+            # Prestadores estrangeiros ajustados na NFTS (UF = EX)
+            ex_notas = [r for r in canon_per if r.get("_ex")]
+
             res = convert(canon_per, im, d1, d2)
 
             # nome do arquivo: IM + período (único dentro do ZIP)
@@ -774,7 +802,7 @@ for i, (tab, f) in enumerate(zip(tabs, files)):
                                "PIS/COFINS/CSLL (mantidas como vieram, conferir): "
                                + ", ".join(sem_corr[:30]) + ("…" if len(sem_corr) > 30 else ""))
 
-            # Resultado da regra de cliente estrangeiro
+            # Resultado da regra de cliente estrangeiro (Prestados: T -> P)
             if usar_exp:
                 if exp_notas:
                     st.info(f"{len(exp_notas)} nota(s) alterada(s) de T para P (cliente estrangeiro).")
@@ -786,6 +814,22 @@ for i, (tab, f) in enumerate(zip(tabs, files)):
                         } for r in exp_notas]), hide_index=True)
                 else:
                     st.caption("Cliente estrangeiro: nenhuma nota T sem CNPJ/CPF e UF no período.")
+
+            # Resultado da regra de prestador estrangeiro (NFTS: UF = EX)
+            if kind == "NFTS" and ex_prest:
+                if ex_notas:
+                    st.info(f"{len(ex_notas)} nota(s) com prestador estrangeiro: "
+                            f"UF = {UF_EXTERIOR} e cidade = endereço do prestador.")
+                    with st.expander(f"Prestadores estrangeiros ajustados ({len(ex_notas)})"):
+                        st.dataframe(pd.DataFrame([{
+                            "Nº": digits(get(r, "Nº NFS-e")),
+                            "Prestador": clean(get(r, "Razão Social do Prestador")).strip(),
+                            "UF gravada": clean(get(r, "UF do Prestador")).strip(),
+                            "Cidade gravada": clean(get(r, "Cidade do Prestador")).strip(),
+                            "Valor serviços": br(cents(get(r, "Valor dos Serviços")) or 0),
+                        } for r in ex_notas]), hide_index=True)
+                else:
+                    st.caption("Prestador estrangeiro: nenhuma nota sem CNPJ/CPF e UF no período.")
 
             if len(res["txt_bytes"]) > MAX_BYTES:
                 st.error("O arquivo gerado excede 10 MB (limite do manual). Divida por período.")
