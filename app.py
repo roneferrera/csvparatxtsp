@@ -5,7 +5,7 @@ import unicodedata
 import zipfile
 from collections import Counter
 from datetime import date, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 
 import pandas as pd
 import streamlit as st
@@ -61,6 +61,13 @@ ZERO_FIELDS = (
 # Opções de data para NFTS (ordens 3 e 8 do TXT ficam iguais)
 OPC_EMISSAO = "Data de emissão da NFTS"
 OPC_FATO = "Data do fato gerador (prestação do serviço)"
+
+# Retenções federais agregadas pela Prefeitura (NFS-e emitidas a partir de 14/05/2026)
+DATA_CORTE_FEDERAIS = date(2026, 5, 14)
+ALIQ = {"PIS": Decimal("0.0065"), "COFINS": Decimal("0.03"), "CSLL": Decimal("0.01")}
+COMBOS = [("PIS",), ("CSLL",), ("PIS", "CSLL"), ("COFINS",),
+          ("PIS", "COFINS"), ("COFINS", "CSLL"), ("PIS", "COFINS", "CSLL")]
+TOL_CENTS = 2
 
 # Data AAAAMMDD válida (2000-2099) e par de datas AAAAMMDD_AAAAMMDD no nome do arquivo.
 # Evita confundir a IM (ex.: 11467690) com uma data.
@@ -141,6 +148,11 @@ def latin1_safe(s):
 
 def br(c):
     return f"{c / 100:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def br_or_blank(s):
+    """Converte o campo de 15 posições do TXT (centavos) em texto monetário; vazio -> ''."""
+    return br(int(s)) if s.strip() else ""
 
 
 def fmt(kind, value, width, default, ctx, nome):
@@ -408,6 +420,54 @@ def contrib_im(rows, role):
     return c.most_common(1)[0][0].rjust(8, "0")[:8] if c else ""
 
 
+# ───────────────────── Retenções federais (PIS / COFINS / CSLL) ─────────────────────
+def _brl(c):
+    return f"{c // 100},{c % 100:02d}"
+
+
+def split_retencoes(r):
+    """NFS-e emitidas a partir de 14/05/2026: a Prefeitura agrega as retenções de PIS, COFINS
+    e CSLL num único valor (ordem 60) e usa PIS/COFINS para o débito próprio.
+    Aqui o valor agregado é desmembrado, porque o sistema contábil lê as retenções separadas.
+    Retorna (linha, status): anterior | sem retenção | desmembrada | sem correspondência."""
+    r = dict(r)
+    dt = parse_dt(get(r, "Data Hora NFE"))
+    if not dt or dt.date() < DATA_CORTE_FEDERAIS:
+        return r, "anterior"
+
+    pis_orig, cof_orig = get(r, "PIS/PASEP"), get(r, "COFINS")
+    total = cents(get(r, "CSLL"))
+    r["PIS/PASEP"] = ""               # débito próprio: não é retenção
+    r["COFINS"] = ""
+    if not total:
+        return r, "sem retenção"
+
+    def sem_correspondencia():
+        r["PIS/PASEP"], r["COFINS"] = pis_orig, cof_orig
+        return r, "sem correspondência"
+
+    base = (cents(get(r, "Valor dos Serviços")) or 0) - (cents(get(r, "Valor das Deduções")) or 0)
+    if base <= 0:
+        return sem_correspondencia()
+
+    melhor, melhor_dif = None, None
+    for combo in COMBOS:
+        vals = {k: int((Decimal(base) * ALIQ[k]).quantize(Decimal("1"), rounding=ROUND_HALF_EVEN))
+                for k in combo}
+        dif = abs(sum(vals.values()) - total)
+        if dif <= TOL_CENTS and (melhor_dif is None or dif < melhor_dif):
+            melhor, melhor_dif = (combo, vals), dif
+    if melhor is None:
+        return sem_correspondencia()
+
+    combo, vals = melhor
+    vals[combo[-1]] += total - sum(vals.values())     # fecha a soma exata com o valor da prefeitura
+    r["PIS/PASEP"] = _brl(vals["PIS"]) if "PIS" in vals else ""
+    r["COFINS"] = _brl(vals["COFINS"]) if "COFINS" in vals else ""
+    r["CSLL"] = _brl(vals["CSLL"]) if "CSLL" in vals else "0,00"
+    return r, "desmembrada"
+
+
 # ───────────────────── Filtro por período ─────────────────────
 def filter_period(rows, d1, d2):
     """Mantém só as notas cuja Data Hora NFE (ordem 3) está entre d1 e d2, inclusive.
@@ -468,7 +528,10 @@ def convert(rows, im, d1, d2):
                      "Situação": vals[23].strip(),
                      "Zerada": "Sim" if zeroed else "",
                      "Valor serviços": br(int(vals[27])), "ISS": br(int(vals[31])),
-                     "Crédito": br(int(vals[32])), "Tam. linha": len(line),
+                     "Crédito": br(int(vals[32])),
+                     "PIS": br_or_blank(vals[56]), "COFINS": br_or_blank(vals[57]),
+                     "CSSL": br_or_blank(vals[60]),
+                     "Tam. linha": len(line),
                      "_vals": vals, "_disc": disc})
     n = len(rows)
     lines.append("9" + str(n).rjust(7, "0") + "".join(str(t).rjust(15, "0") for t in tot))
@@ -503,7 +566,9 @@ with st.sidebar:
                "Na **NFTS**, o Tipo de RPS é gravado como **RPS** e as duas datas do TXT "
                "(Data/Hora NFE e Data do RPS) são iguais, conforme a escolha feita na aba. "
                "O TXT contém **somente as notas do período selecionado** "
-               "(filtro pela Data/Hora NFE, início e fim inclusive).")
+               "(filtro pela Data/Hora NFE, início e fim inclusive). "
+               "Nas **NFS-e** emitidas a partir de 14/05/2026, as retenções agregadas de "
+               "PIS/COFINS/CSLL podem ser **desmembradas** (opção na aba).")
 
 files = st.file_uploader("Selecione os CSVs (NFS-e prestados, NFS-e tomados e/ou NFTS)",
                          type=["csv"], accept_multiple_files=True)
@@ -529,6 +594,22 @@ for i, (tab, f) in enumerate(zip(tabs, files)):
                 base_data = "fato" if escolha == OPC_FATO else "emissao"
 
             canon = [nfts_to_nfse(r, base_data) for r in rows] if kind == "NFTS" else rows
+
+            # Retenções federais agregadas (somente NFS-e)
+            split_cnt, sem_corr = None, []
+            if kind == "NFS-e" and canon:
+                desm = st.checkbox(
+                    "Desmembrar PIS/COFINS/CSLL retidos (NFS-e a partir de 14/05/2026)",
+                    value=True, key=f"split_{i}",
+                    help="A Prefeitura passou a agregar as retenções num só valor (ordem 60). "
+                         "O app separa PIS, COFINS e CSLL para o sistema contábil.")
+                if desm:
+                    res_split = [split_retencoes(r) for r in canon]
+                    canon = [x[0] for x in res_split]
+                    split_cnt = Counter(x[1] for x in res_split)
+                    sem_corr = [digits(get(x[0], "Nº NFS-e"))
+                                for x in res_split if x[1] == "sem correspondência"]
+
             if not canon:
                 st.warning("Nenhum registro de detalhe encontrado.")
                 continue
@@ -591,6 +672,16 @@ for i, (tab, f) in enumerate(zip(tabs, files)):
             m2[0].metric("Σ Valor dos serviços", br(res["tot"][0]))
             m2[1].metric("Σ ISS", br(res["tot"][2]))
             m2[2].metric("Σ Crédito", br(res["tot"][3]))
+
+            if split_cnt is not None:
+                st.caption(f"Retenções federais: {split_cnt.get('desmembrada', 0)} desmembradas, "
+                           f"{split_cnt.get('sem retenção', 0)} sem retenção, "
+                           f"{split_cnt.get('anterior', 0)} anteriores a 14/05/2026, "
+                           f"{split_cnt.get('sem correspondência', 0)} sem correspondência.")
+                if sem_corr:
+                    st.warning("Notas com valor de retenção que não bate com nenhuma combinação de "
+                               "PIS/COFINS/CSLL (mantidas como vieram, conferir): "
+                               + ", ".join(sem_corr[:30]) + ("…" if len(sem_corr) > 30 else ""))
 
             if len(res["txt_bytes"]) > MAX_BYTES:
                 st.error("O arquivo gerado excede 10 MB (limite do manual). Divida por período.")
