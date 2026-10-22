@@ -70,6 +70,11 @@ COMBOS = [("PIS",), ("CSLL",), ("PIS", "CSLL"), ("COFINS",),
           ("PIS", "COFINS"), ("COFINS", "CSLL"), ("PIS", "COFINS", "CSLL")]
 TOL_CENTS = 2
 
+# Modos de tratamento das retenções federais (NFS-e a partir de 14/05/2026)
+MODO_AGREGADO = "CRF agregado na ordem 60 (ordens 56/57 em branco)"
+MODO_DESMEMBRADO = "Desmembrar PIS/COFINS/CSLL"
+MODO_ORIGINAL = "Não alterar (layout da Prefeitura)"
+
 # Data AAAAMMDD válida (2000-2099) e par de datas AAAAMMDD_AAAAMMDD no nome do arquivo.
 # Evita confundir a IM (ex.: 11467690) com uma data.
 DATE8 = r"20\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])"
@@ -440,10 +445,27 @@ def _brl(c):
     return f"{c // 100},{c % 100:02d}"
 
 
+def agregar_retencoes(r):
+    """NFS-e emitidas a partir de 14/05/2026 (MODO PADRÃO): a Prefeitura grava o CRF agregado
+    (PIS+COFINS+CSLL retidos) na ordem 60 e usa PIS/COFINS (ordens 56/57) para o débito próprio.
+    O Domínio lê a ordem 60 como o CRF total; por isso o valor da ordem 60 é mantido como veio
+    e as ordens 56/57 são deixadas em branco (para não serem lidas como retenção).
+    Retorna (linha, status): anterior | sem retenção | agregada."""
+    r = dict(r)
+    dt = parse_dt(get(r, "Data Hora NFE"))
+    if not dt or dt.date() < DATA_CORTE_FEDERAIS:
+        return r, "anterior"
+    r["PIS/PASEP"] = ""
+    r["COFINS"] = ""
+    if not cents(get(r, "CSLL")):
+        return r, "sem retenção"
+    return r, "agregada"
+
+
 def split_retencoes(r):
-    """NFS-e emitidas a partir de 14/05/2026: a Prefeitura agrega as retenções de PIS, COFINS
-    e CSLL num único valor (ordem 60) e usa PIS/COFINS para o débito próprio.
-    Aqui o valor agregado é desmembrado, porque o sistema contábil lê as retenções separadas.
+    """MODO OPCIONAL: desmembra o valor agregado da ordem 60 em PIS, COFINS e CSLL.
+    ATENÇÃO: o Domínio leu somente a CSLL (1%) quando recebeu o arquivo desmembrado.
+    Use apenas se o sistema de destino ler as retenções separadas.
     Retorna (linha, status): anterior | sem retenção | desmembrada | sem correspondência."""
     r = dict(r)
     dt = parse_dt(get(r, "Data Hora NFE"))
@@ -622,8 +644,9 @@ with st.sidebar:
                "O TXT contém **somente as notas do período selecionado** "
                "(filtro pela Data/Hora NFE, início e fim inclusive). "
                "Em **Tomados** e em **NFTS**, notas **canceladas não geram linha**. "
-               "Nas **NFS-e** emitidas a partir de 14/05/2026, as retenções agregadas de "
-               "PIS/COFINS/CSLL podem ser **desmembradas** (opção na aba). "
+               "Nas **NFS-e** emitidas a partir de 14/05/2026, o padrão mantém o **CRF agregado "
+               "na ordem 60** (CSLL) e deixa as ordens 56/57 em branco, que é como o Domínio "
+               "interpreta; o desmembramento é opcional (opção na aba). "
                "Em **NFS-e Prestados**, clientes sem CNPJ/CPF e UF podem ser tratados como "
                "**estrangeiros** (situação T alterada para P, opção na aba).")
 
@@ -661,13 +684,20 @@ for i, (tab, f) in enumerate(zip(tabs, files)):
 
             # Retenções federais agregadas (somente NFS-e)
             split_cnt, sem_corr = None, []
+            modo_fed = MODO_ORIGINAL
             if kind == "NFS-e" and canon:
-                desm = st.checkbox(
-                    "Desmembrar PIS/COFINS/CSLL retidos (NFS-e a partir de 14/05/2026)",
-                    value=True, key=f"split_{i}",
-                    help="A Prefeitura passou a agregar as retenções num só valor (ordem 60). "
-                         "O app separa PIS, COFINS e CSLL para o sistema contábil.")
-                if desm:
+                modo_fed = st.radio(
+                    "Retenções federais (NFS-e a partir de 14/05/2026)",
+                    [MODO_AGREGADO, MODO_DESMEMBRADO, MODO_ORIGINAL],
+                    index=0, horizontal=True, key=f"fed_{i}",
+                    help="Agregado (padrão): ordem 60 com o CRF total (PIS+COFINS+CSLL) e ordens "
+                         "56/57 em branco. Desmembrar: separa PIS, COFINS e CSLL. "
+                         "Não alterar: grava exatamente como a Prefeitura.")
+                if modo_fed == MODO_AGREGADO:
+                    res_fed = [agregar_retencoes(r) for r in canon]
+                    canon = [x[0] for x in res_fed]
+                    split_cnt = Counter(x[1] for x in res_fed)
+                elif modo_fed == MODO_DESMEMBRADO:
                     res_split = [split_retencoes(r) for r in canon]
                     canon = [x[0] for x in res_split]
                     split_cnt = Counter(x[1] for x in res_split)
@@ -772,13 +802,18 @@ for i, (tab, f) in enumerate(zip(tabs, files)):
             # Somas das retenções federais (PIS, COFINS, CSLL, INSS, IR)
             r1 = res["ret"]
             if kind == "NFS-e" or sum(r1.values()) > 0:
+                agreg_on = (modo_fed == MODO_AGREGADO)
                 m3 = st.columns(6)
-                m3[0].metric("Σ PIS retido", br(r1["PIS"]))
-                m3[1].metric("Σ COFINS retido", br(r1["COFINS"]))
-                m3[2].metric("Σ CSLL retido", br(r1["CSSL"]))
+                m3[0].metric("Σ PIS (ordem 56)", br(r1["PIS"]))
+                m3[1].metric("Σ COFINS (ordem 57)", br(r1["COFINS"]))
+                m3[2].metric("Σ CRF agregado (ordem 60)" if agreg_on else "Σ CSLL retido",
+                             br(r1["CSSL"]))
                 m3[3].metric("Σ INSS", br(r1["INSS"]))
                 m3[4].metric("Σ IR", br(r1["IR"]))
                 m3[5].metric("Σ PIS+COFINS+CSLL", br(r1["PIS"] + r1["COFINS"] + r1["CSSL"]))
+                if agreg_on:
+                    st.caption("Notas a partir de 14/05/2026: a ordem 60 traz o CRF agregado "
+                               "(PIS+COFINS+CSLL retidos); as ordens 56/57 ficam em branco.")
 
             # Conferência do desmembramento: soma separada x valor agregado da Prefeitura (ordem 60)
             desm_rows = [r for r in canon_per if "_agreg" in r and not must_zero(r)]
@@ -793,7 +828,8 @@ for i, (tab, f) in enumerate(zip(tabs, files)):
                     st.error(f"Divergência: agregado R$ {br(agreg)} x separado R$ {br(separado)}")
 
             if split_cnt is not None:
-                st.caption(f"Retenções federais: {split_cnt.get('desmembrada', 0)} desmembradas, "
+                st.caption(f"Retenções federais: {split_cnt.get('agregada', 0)} com CRF agregado, "
+                           f"{split_cnt.get('desmembrada', 0)} desmembradas, "
                            f"{split_cnt.get('sem retenção', 0)} sem retenção, "
                            f"{split_cnt.get('anterior', 0)} anteriores a 14/05/2026, "
                            f"{split_cnt.get('sem correspondência', 0)} sem correspondência.")
